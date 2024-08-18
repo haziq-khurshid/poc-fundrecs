@@ -1,0 +1,5 @@
+[
+    {"product_id": 1, "product_name": "Laptop", "category": "Electronics", "price": 1200.00},
+    {"product_id": 2, "product_name": "Phone", "category": "Electronics", "price": 800.00},
+    {"product_id": 3, "product_name": "Desk Chair", "category": "Furniture", "price": 150.00}
+]
