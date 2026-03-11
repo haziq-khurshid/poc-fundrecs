@@ -1,78 +1,175 @@
-# poc-fundrecs
-POC - Realtime Data Pipeline with Change Data Capture (CDC)
+# poc-fundrecs — Real-Time CDC Data Pipeline
 
-## Overview:
-This POC demonstrates a scalable and real-time data pipeline using AWS-managed services. The pipeline captures Change Data Capture (CDC) events from a PostgreSQL database hosted on Amazon RDS, processes them using AWS DMS, Kinesis Data Streams, and Lambda, and stores the transformed data in S3. The data is then queried using Amazon Athena for real-time analytics.
+A proof-of-concept real-time Change Data Capture (CDC) pipeline built on AWS managed services. Captures database changes from PostgreSQL in real-time, enriches and transforms them via Lambda, and makes them immediately queryable via Athena — all without managing any streaming infrastructure.
 
-## Architecture Diagram
-![Blank diagram (1)](https://github.com/user-attachments/assets/e57d6dff-b45e-4a9d-af63-c61b8e5adf1f)
+---
 
-## Step by Step guide to setting up the solution
-### 1. Setting up Amazon RDS (PostgreSQL) database:
-- Create an Amazon RDS database with the PostgreSQL engine.
-- Store database credentials in secret in the AWS secrets manager
-- Edit inbound rules of the security group to allow access to DB from your local machine
-### 2. Enable CDC on database:
-**Pre-requisite:** Ensure that the **wal_level** is set to logical for logical replication.
-- Create a new parameter group for the RDS database
-- In the parameter group, find and **set rds.logical_replication to 1**.
-- Attach the newly created parameter group to DB and reboot the DB
-- Verify changes using SQL query **"SHOW wal_level;"**, it should return logical instead of minimal
-- Create a logical replication slot in your database. This replication slot will be used to track changes.
-- Create a logical replication slot:
-```SELECT * FROM pg_create_logical_replication_slot('fundrecs_slot', 'pgoutput');```
-- Verify the replication slot:
-```SELECT * FROM pg_replication_slots;```
+## Architecture
 
-### 3. Populate sample data:
-#### Schema Overview and Transformation Logic
-The source PostgreSQL database consists of two main tables within a custom schema called **fundrecs_schema**:
+```
+┌─────────────────┐     CDC (logical      ┌─────────────┐
+│  Amazon RDS     │     replication)      │  AWS DMS    │
+│  PostgreSQL     │ ─────────────────────▶│  Migration  │
+│  (source DB)    │                       │  Task       │
+└─────────────────┘                       └──────┬──────┘
+                                                 │ streams records
+                                                 ▼
+                                        ┌─────────────────┐
+                                        │  Kinesis Data   │
+                                        │  Streams        │
+                                        └────────┬────────┘
+                                                 │ triggers on new records
+                                                 ▼
+                              ┌──────────────────────────────────┐
+                              │         AWS Lambda               │
+                              │  - Decodes Kinesis records       │
+                              │  - Joins with static product     │
+                              │    data from S3                  │
+                              │  - Calculates total_price        │
+                              │  - Routes by product category    │
+                              └──────────────┬───────────────────┘
+                                             │ writes CSV partitions
+                                             ▼
+                                    ┌────────────────┐
+                                    │   Amazon S3    │
+                                    │  (data lake)   │
+                                    │  cdc-transformed/
+                                    │  ├── customers/│
+                                    │  ├── electronics/
+                                    │  └── clothing/ │
+                                    └───────┬────────┘
+                                            │ queried by
+                                            ▼
+                                    ┌────────────────┐
+                                    │ Amazon Athena  │
+                                    │ (ad-hoc SQL    │
+                                    │  analytics)    │
+                                    └────────────────┘
+```
 
-1- Orders Table:
-Purpose: Store details of customer orders.
+---
 
-2- Customers Table:
-Purpose: Stores information about customers.
+## Tech Stack
 
-Run the SQL script in the ```schema.sql``` file to set up the initial schema.
+| Component | Technology |
+|-----------|-----------|
+| Source Database | Amazon RDS (PostgreSQL) |
+| CDC Mechanism | PostgreSQL logical replication (`pgoutput`) |
+| CDC Capture & Delivery | AWS DMS (Database Migration Service) |
+| Streaming | Amazon Kinesis Data Streams |
+| Transformation | AWS Lambda (Python 3.x) |
+| Static Data Store | Amazon S3 (JSON) |
+| Data Lake | Amazon S3 (CSV partitioned by category/timestamp) |
+| Analytics | Amazon Athena |
+| Secrets Management | AWS Secrets Manager |
 
-### 4. Setup DMS for CDC:
-- Create a DMS replication instance (version should be compatible with Postgres version)
-- Ensure that you select the same VPC as your RDS instance
-- Create a **source endpoint** for RDS
-- Create a data stream in Amazon Kinesis to be used as the target for DMS
-- Create a **target endpoint** for Kinesis data stream
+---
 
-#### DMS Migration Task
-- Create a DMS migration task with a previously created replication instance, source endpoint, and target endpoint
-- In migration option: Choose **Migrate existing data and replicate ongoing changes**.
-- In table mappings: Map the **orders** and **customers** tables from the source schema (fundrecs_schema) to the target.
-- Create migration task by leaving other options as default
+## How It Works
 
-**Once the DMS task is running, you can verify the CDC by checking the records from source data into the Kinesis data stream.**
+### 1. CDC at the Source
+PostgreSQL is configured with `wal_level=logical`, enabling logical replication. A replication slot (`fundrecs_slot` using `pgoutput`) tracks every INSERT, UPDATE, and DELETE on the `orders` and `customers` tables.
 
-### 5. Upload static data in S3:
-- Upload the ```product_details.json``` file in an S3 bucket
-- This file contains some product details which we will use in the transformation step by joining with source data
+### 2. DMS Captures and Streams Changes
+AWS DMS reads from the replication slot and forwards each change event as a structured JSON record into Kinesis Data Streams. The DMS task runs in **"Migrate existing data and replicate ongoing changes"** mode — so it handles both initial load and ongoing CDC.
 
-### 6. Setup a Lambda function to perform Transformations:
-- Create a lambda function with code available in the ```poc-lambda.py``` file
-- Configure a source trigger with Kinesis Data Stream as the source. It will trigger lambda when there are new records in data stream from DMS
-- Join source data with static data from S3 and perform calculations to identify **Total Price** of an order
-- Categorize data into multiple categories based on product category.
-- Store categorized data into target S3 bucket for Analysis
+### 3. Lambda Transforms in Real-Time
+Each Kinesis record triggers a Lambda invocation. The Lambda:
+- Decodes the base64-encoded Kinesis payload
+- Skips DMS control records (metadata-only events)
+- Routes by `table-name` (`orders` vs `customers`)
+- For orders: joins against static product data loaded from S3, computes `total_price = price × quantity`, and routes the enriched record into a category-keyed bucket
+- Writes partitioned CSVs to S3 under `cdc-transformed/{category}/{timestamp}.csv`
 
-### 7. Query data using Athena:
-- Create a DB in Athena and tables based on the transformed data uploaded on S3
-- Run the SQL queries from ```athena.sql``` file
-- Verify data categorized into separate categories based on product category
+### 4. Athena for Analytics
+Athena tables sit on top of the S3 partitions. Once Lambda writes new files, they are immediately queryable — no ETL jobs, no loading step.
 
-### 8. Test end-to-end Pipeline
-- In order to test the end to end pipeline, Insert few records in source tables on RDS database
-- You should see the new records in Athena tables in real-time
+---
 
+## Key Technical Decisions
 
+**Why DMS + Kinesis instead of Debezium/Kafka?**
+For a POC focused on AWS-native infrastructure, DMS removes the need to self-manage a Kafka cluster. Kinesis provides similar streaming semantics (ordered, durable, replay-capable) with zero ops overhead. In a production system at scale, a managed Kafka (Confluent or MSK) would offer more flexibility for multi-consumer fan-out.
 
+**Why static product data in S3 instead of a database lookup?**
+Lambda cold-start latency and connection pooling constraints make direct DB lookups per-record expensive. Loading product data once per Lambda invocation (warm container reuse) and holding it in memory for the batch is far more efficient. The product catalogue is small and changes infrequently — S3 is the right fit.
 
-  
- 
+**Why CSV output partitioned by category?**
+Athena performs best when data is partitioned to allow partition pruning. Routing orders by product category at write-time means category-filtered queries in Athena skip irrelevant S3 objects entirely. The trade-off is slightly more complex Lambda routing logic, which is minimal.
+
+**Why `pgoutput` replication plugin?**
+`pgoutput` is the native PostgreSQL logical decoding plugin — no external extensions needed. DMS supports it directly, keeping the RDS setup standard and compatible with future PostgreSQL upgrades.
+
+---
+
+## Setup & Running Locally
+
+### Prerequisites
+- AWS account with appropriate IAM permissions
+- AWS CLI configured
+- PostgreSQL client (psql)
+
+### Step 1 — RDS Setup
+1. Create an RDS PostgreSQL instance
+2. Store credentials in AWS Secrets Manager
+3. Open security group inbound rules to allow local machine access
+
+### Step 2 — Enable CDC on RDS
+```sql
+-- Verify WAL level (must be 'logical')
+SHOW wal_level;
+
+-- Create logical replication slot
+SELECT * FROM pg_create_logical_replication_slot('fundrecs_slot', 'pgoutput');
+
+-- Verify slot creation
+SELECT * FROM pg_replication_slots;
+```
+
+If `wal_level` is not `logical`: create a custom RDS parameter group, set `rds.logical_replication=1`, attach it to the instance, and reboot.
+
+### Step 3 — Create Schema & Seed Data
+```bash
+psql -h <rds-endpoint> -U <user> -d <db> -f schema.sql
+```
+
+### Step 4 — Upload Static Data
+```bash
+aws s3 cp product_details.json s3://poc-fundrecs/static-data/product_details.json
+```
+
+### Step 5 — Deploy DMS
+1. Create a DMS replication instance in the same VPC as RDS
+2. Create source endpoint pointing to RDS (use Secrets Manager for credentials)
+3. Create a Kinesis Data Stream
+4. Create target endpoint pointing to Kinesis
+5. Create migration task: **"Migrate existing data and replicate ongoing changes"**, map `fundrecs_schema.orders` and `fundrecs_schema.customers`
+
+### Step 6 — Deploy Lambda
+1. Create Lambda function with code from `poc-lambda.py`
+2. Attach Kinesis trigger pointing to your data stream
+3. Grant Lambda IAM permissions: `s3:GetObject`, `s3:PutObject`, `kinesis:GetRecords`
+
+### Step 7 — Configure Athena
+Run the SQL in `athena.sql` to create Athena database and external tables over the S3 output prefix.
+
+### Step 8 — End-to-End Test
+```sql
+-- Insert test records on RDS
+INSERT INTO fundrecs_schema.orders (product_id, customer_id, quantity, order_date)
+VALUES (1, 101, 3, NOW());
+```
+
+Within seconds, the record should appear in Athena via the CDC → DMS → Kinesis → Lambda → S3 → Athena chain.
+
+---
+
+## Project Structure
+
+```
+poc-fundrecs/
+├── poc-lambda.py        # Lambda transformation function
+├── schema.sql           # Source PostgreSQL schema (orders + customers tables)
+├── athena.sql           # Athena DDL for querying transformed S3 data
+└── product_details.json # Static product reference data (loaded by Lambda from S3)
+```
